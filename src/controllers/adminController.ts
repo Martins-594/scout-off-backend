@@ -2,7 +2,8 @@ import { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import jwt from 'jsonwebtoken';
 import { getEvents, getEventsCount, getLastLedger, setLastLedger, getValidatorStats, getAuditLogs, getAuditLogsCount } from '../db';
-import { getAllValidators, insertValidator, revokeValidatorRow } from '../services/indexer';
+import { getAllValidators, insertValidator, revokeValidatorRow, getValidatorByWallet } from '../services/indexer';
+import { isValidStellarAddress } from '../utils/stellarAddress';
 import { ApiResponse, EventRecord, ContractEventType } from '../types';
 import { logAuditEvent } from '../services/audit';
 import { withdrawFees as stellarWithdrawFees, FeeWithdrawalError, FeeWithdrawalResult, unpauseContractOnChain } from '../services/stellar';
@@ -585,6 +586,200 @@ export async function updatePlatformFee(req: Request, res: Response, next: NextF
       success: true,
       message: `Platform fee update to ${platformFeeBps} bps submitted (simulated)`,
       transactionId: 'stub-platform-fee-txn-placeholder',
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ─── Validator import types ───────────────────────────────────────────────────
+
+export interface ImportValidatorEntry {
+  wallet: string;
+  label?: string;
+  region?: string;
+}
+
+export type ImportResultStatus = 'registered' | 'duplicate' | 'invalid';
+
+export interface ImportValidatorResult {
+  wallet: string;
+  status: ImportResultStatus;
+  reason?: string;
+  label?: string;
+  region?: string;
+}
+
+/**
+ * Parse a CSV text body into an array of ImportValidatorEntry objects.
+ *
+ * Supported formats:
+ *   - Single-column:  wallet
+ *   - Two-column:     wallet,label
+ *   - Three-column:   wallet,label,region
+ *
+ * Lines beginning with # or empty lines are ignored.
+ * A header row whose first token is the literal "wallet" (case-insensitive)
+ * is silently skipped.
+ */
+export function parseCsvBody(text: string): ImportValidatorEntry[] {
+  const entries: ImportValidatorEntry[] = [];
+  const lines = text.split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const cols = line.split(',').map((c) => c.trim());
+    // Skip header row
+    if (cols[0].toLowerCase() === 'wallet') continue;
+    const [wallet, label, region] = cols;
+    entries.push({ wallet: wallet ?? '', label: label || undefined, region: region || undefined });
+  }
+  return entries;
+}
+
+/**
+ * Process a batch of ImportValidatorEntry items and return per-entry results.
+ * Delegates registration to the same insertValidator() path used by the single-
+ * registration endpoint so no registration logic is duplicated.
+ *
+ * Duplicate detection:
+ *   - A validator that already exists AND is not revoked → "duplicate"
+ *   - A validator that was previously revoked is re-registered (same as single-
+ *     registration, which also does INSERT OR REPLACE)
+ */
+export function processBatch(
+  entries: ImportValidatorEntry[],
+  adminWallet: string,
+): ImportValidatorResult[] {
+  const results: ImportValidatorResult[] = [];
+  // Track wallets already seen in this batch to handle intra-batch duplicates
+  const seenInBatch = new Set<string>();
+
+  for (const entry of entries) {
+    const { wallet, label, region } = entry;
+
+    // 1. Validate the address
+    if (!isValidStellarAddress(wallet)) {
+      logger.warn(`[admin] import_validator rejected — invalid address | admin=${adminWallet} target=${wallet}`);
+      results.push({ wallet, status: 'invalid', reason: 'invalid Stellar address', label, region });
+      continue;
+    }
+
+    // 2. Check intra-batch duplicate
+    if (seenInBatch.has(wallet)) {
+      results.push({ wallet, status: 'duplicate', reason: 'duplicate within batch', label, region });
+      continue;
+    }
+
+    // 3. Check DB for an already-active (non-revoked) registration
+    const existing = getValidatorByWallet(wallet);
+    if (existing && existing.revoked_at === null) {
+      results.push({ wallet, status: 'duplicate', reason: 'already registered', label, region });
+      seenInBatch.add(wallet);
+      continue;
+    }
+
+    // 4. Register — reuses the same insertValidator path as the single endpoint
+    logger.info(`[admin] action=import_register_validator admin=${adminWallet} target=${wallet}`);
+    // TODO: invoke register_validator on Soroban contract (same as single-registration endpoint)
+    insertValidator(wallet);
+    seenInBatch.add(wallet);
+    results.push({ wallet, status: 'registered', label, region });
+  }
+
+  return results;
+}
+
+/**
+ * POST /api/admin/validators/import
+ *
+ * Accepts either:
+ *   - JSON body:  { validators: [{ wallet, label?, region? }, …] }
+ *   - CSV body:   Content-Type: text/csv  with rows: wallet[,label[,region]]
+ *
+ * Returns a per-entry result summary so partial failures don't block the whole
+ * batch. Invalid addresses and already-registered (non-revoked) validators are
+ * skipped cleanly rather than erroring the request.
+ *
+ * @response 200 { success: true, data: { results, summary: { total, registered, duplicates, invalid } } }
+ * @response 400 { success: false, error: string } - Unparseable body or no entries
+ * @auth Bearer (admin role required)
+ */
+export async function importValidators(req: Request, res: Response, next: NextFunction) {
+  try {
+    const adminWallet = req.account ?? 'unknown';
+    const contentType = (req.headers['content-type'] ?? '').toLowerCase();
+
+    let entries: ImportValidatorEntry[];
+
+    if (contentType.includes('text/csv') || contentType.includes('text/plain')) {
+      // ── CSV path ──────────────────────────────────────────────────────────
+      const rawBody = req.body as string;
+      if (typeof rawBody !== 'string' || !rawBody.trim()) {
+        res.status(400).json({ success: false, error: 'CSV body is empty', code: ErrorCode.VALIDATION_ERROR });
+        return;
+      }
+      entries = parseCsvBody(rawBody);
+    } else {
+      // ── JSON path (default) ───────────────────────────────────────────────
+      const jsonBody = req.body as { validators?: unknown };
+      if (!jsonBody || !Array.isArray(jsonBody.validators)) {
+        res.status(400).json({
+          success: false,
+          error: 'Request body must contain a "validators" array or use Content-Type: text/csv',
+          code: ErrorCode.VALIDATION_ERROR,
+        });
+        return;
+      }
+
+      // Coerce each item — we accept { wallet } at minimum; label/region are optional strings
+      entries = (jsonBody.validators as Array<unknown>).map((item) => {
+        if (typeof item === 'string') return { wallet: item };
+        if (item && typeof item === 'object') {
+          const obj = item as Record<string, unknown>;
+          return {
+            wallet: typeof obj['wallet'] === 'string' ? obj['wallet'] : '',
+            label: typeof obj['label'] === 'string' ? obj['label'] : undefined,
+            region: typeof obj['region'] === 'string' ? obj['region'] : undefined,
+          };
+        }
+        return { wallet: '' };
+      });
+    }
+
+    if (entries.length === 0) {
+      res.status(400).json({ success: false, error: 'No validator entries found in request', code: ErrorCode.VALIDATION_ERROR });
+      return;
+    }
+
+    const results = processBatch(entries, adminWallet);
+
+    const registered = results.filter((r) => r.status === 'registered').length;
+    const duplicates = results.filter((r) => r.status === 'duplicate').length;
+    const invalid = results.filter((r) => r.status === 'invalid').length;
+
+    logger.info(
+      `[admin] action=import_validators admin=${adminWallet} total=${results.length} registered=${registered} duplicates=${duplicates} invalid=${invalid}`,
+    );
+
+    logAuditEvent({
+      action: 'bulk_validator_import',
+      adminWallet,
+      queryParams: { total: results.length, registered, duplicates, invalid },
+      timestamp: new Date().toISOString(),
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        results,
+        summary: {
+          total: results.length,
+          registered,
+          duplicates,
+          invalid,
+        },
+      },
     });
   } catch (err) {
     next(err);
