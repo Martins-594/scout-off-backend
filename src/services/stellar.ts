@@ -286,9 +286,39 @@ export async function renewSubscription(
   };
 }
 
+export type SubscriptionErrorCode =
+  | 'NOT_SUBSCRIBED'
+  | 'ALREADY_CANCELLED'
+  | 'UNAUTHORIZED'
+  | 'NETWORK_ERROR';
+
 /**
- * Stub: invoke cancel_subscription(scout) on the Soroban contract.
- * Records the cancellation intent on-chain.
+ * Thrown when a cancel_subscription contract call cannot proceed due to a
+ * known on-chain state — e.g. the scout was never subscribed or the
+ * subscription was already cancelled.  These map to 4xx HTTP responses, not
+ * 5xx, so we keep them separate from PaymentError.
+ */
+export class SubscriptionError extends Error {
+  constructor(
+    message: string,
+    public readonly code: SubscriptionErrorCode,
+  ) {
+    super(message);
+    this.name = 'SubscriptionError';
+  }
+}
+
+/**
+ * Invoke `cancel_subscription(scout)` on the Soroban contract.
+ *
+ * Flow mirrors unpauseContractOnChain():
+ *   getAccount → build tx → simulateTransaction → assembleTransaction
+ *   → sign → sendTransaction → poll getTransaction until final status.
+ *
+ * On success returns the confirmed transaction hash.
+ * Maps Soroban contract error codes to SubscriptionError:
+ *   #8 NotSubscribed  → code: 'NOT_SUBSCRIBED'
+ *   #9 Unauthorized   → code: 'UNAUTHORIZED'
  */
 export async function cancelSubscriptionOnChain(
   scoutWallet: string,
@@ -296,8 +326,69 @@ export async function cancelSubscriptionOnChain(
   if (!scoutWallet) {
     throw new PaymentError('Missing scoutWallet', 'INVALID_ACCOUNT');
   }
-  // TODO: build and submit cancel_subscription Soroban transaction
-  return { transactionId: `stub-cancel-txid-${Date.now()}` };
+
+  const { getPlatformKeypair } = await import('../utils/signer');
+  const keypair = getPlatformKeypair();
+
+  const account = await server.getAccount(keypair.publicKey());
+  const contract = new Contract(config.contractId);
+
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: networkPassphrase(),
+  })
+    .addOperation(
+      contract.call('cancel_subscription', Address.fromString(scoutWallet).toScVal()),
+    )
+    .setTimeout(30)
+    .build();
+
+  const simResult = await server.simulateTransaction(tx);
+
+  if (SorobanRpc.Api.isSimulationError(simResult)) {
+    const errMsg = simResult.error ?? '';
+    // Contract error #8 = NotSubscribed
+    if (errMsg.includes('#8') || /not.?subscribed/i.test(errMsg)) {
+      throw new SubscriptionError('Scout has no active on-chain subscription', 'NOT_SUBSCRIBED');
+    }
+    // Contract error #9 = Unauthorized
+    if (errMsg.includes('#9') || /unauthorized/i.test(errMsg)) {
+      throw new SubscriptionError('Unauthorized: wallet is not allowed to cancel this subscription', 'UNAUTHORIZED');
+    }
+    throw new PaymentError(`Simulation failed: ${errMsg}`, 'NETWORK_ERROR');
+  }
+
+  const preparedTx = SorobanRpc.assembleTransaction(tx, simResult).build();
+  preparedTx.sign(keypair);
+
+  const sendResult = await server.sendTransaction(preparedTx);
+  if (sendResult.status === 'ERROR') {
+    throw new PaymentError(`Submit failed: ${sendResult.errorResult}`, 'NETWORK_ERROR');
+  }
+
+  const hash = sendResult.hash;
+
+  let getResult = await server.getTransaction(hash);
+  while (getResult.status === SorobanRpc.Api.GetTransactionStatus.NOT_FOUND) {
+    await new Promise((r) => setTimeout(r, 1000));
+    getResult = await server.getTransaction(hash);
+  }
+
+  if (getResult.status === SorobanRpc.Api.GetTransactionStatus.FAILED) {
+    // Inspect the result XDR for contract-level error codes.
+    // Cast through unknown because GetFailedTransactionResponse and
+    // GetSuccessfulTransactionResponse share no overlapping status type.
+    const resultMeta = ((getResult as unknown) as { resultMetaXdr?: string }).resultMetaXdr ?? '';
+    if (resultMeta.includes('#8') || /not.?subscribed/i.test(resultMeta)) {
+      throw new SubscriptionError('Scout has no active on-chain subscription', 'NOT_SUBSCRIBED');
+    }
+    if (resultMeta.includes('#9') || /unauthorized/i.test(resultMeta)) {
+      throw new SubscriptionError('Unauthorized: wallet is not allowed to cancel this subscription', 'UNAUTHORIZED');
+    }
+    throw new PaymentError('cancel_subscription transaction failed on-chain', 'NETWORK_ERROR');
+  }
+
+  return { transactionId: hash };
 }
 
 export interface ContractActionResult {

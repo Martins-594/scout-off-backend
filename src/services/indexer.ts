@@ -233,3 +233,12 @@ export function getAllValidators(): ValidatorRow[] {
     `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators ORDER BY registered_at DESC`
   ).all() as ValidatorRow[];
 }
+
+/**
+ * Return a single validator row by wallet address, or null if not found.
+ */
+export function getValidatorByWallet(wallet: string): ValidatorRow | null {
+  return (getDb().prepare(
+    `SELECT wallet, registered_at, revoked_at, tx_hash FROM validators WHERE wallet = ?`
+  ).get(wallet) as ValidatorRow | undefined) ?? null;
+}

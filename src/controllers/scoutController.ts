@@ -18,6 +18,7 @@ import {
   isSubscribed,
   purchaseSubscription,
   PaymentError,
+  SubscriptionError,
   renewSubscription as stellarRenewSubscription,
   logTrialOffer as stellarLogTrialOffer,
   cancelSubscriptionOnChain,
@@ -291,8 +292,9 @@ export async function renewSubscription(req: Request, res: Response, next: NextF
 
 /**
  * DELETE /api/scouts/:wallet/subscribe — cancel an active subscription.
- * Returns 404 if no active subscription exists.
- * Records cancellation on-chain and sets cancelled_at locally.
+ * Returns 404 if no active subscription exists locally or on-chain.
+ * Returns 403 if the contract rejects the caller as unauthorized.
+ * Records cancellation on-chain first; DB row is only updated after confirmation.
  */
 export async function cancelSubscription(req: Request, res: Response, next: NextFunction) {
   try {
@@ -308,7 +310,9 @@ export async function cancelSubscription(req: Request, res: Response, next: Next
       return;
     }
 
-    // Record on-chain cancellation intent
+    // Submit on-chain first — DB is only updated after this succeeds.
+    // SubscriptionError (NOT_SUBSCRIBED / UNAUTHORIZED) maps to 4xx.
+    // PaymentError maps to 402. Unexpected errors bubble to the 500 handler.
     const onChainResult = await cancelSubscriptionOnChain(wallet);
 
     const now = Math.floor(Date.now() / 1000);
@@ -325,6 +329,11 @@ export async function cancelSubscription(req: Request, res: Response, next: Next
       },
     });
   } catch (err) {
+    if (err instanceof SubscriptionError) {
+      const status = err.code === 'UNAUTHORIZED' ? 403 : 404;
+      res.status(status).json({ success: false, error: err.message, code: err.code });
+      return;
+    }
     if (err instanceof PaymentError) {
       res.status(402).json({ success: false, error: err.message, code: err.code });
       return;

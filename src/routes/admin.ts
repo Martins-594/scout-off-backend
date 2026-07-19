@@ -1,5 +1,6 @@
 import { Router } from 'express';
-import { getStats, getAllEvents, getFeeSummary, listValidators, registerValidator, revokeValidator, pauseContract, unpauseContract, withdrawFeesController, introspectToken, revokeTokenController, reindex, getValidatorStatsEndpoint, getAuditLog } from '../controllers/adminController';
+import express from 'express';
+import { getStats, getAllEvents, getFeeSummary, listValidators, registerValidator, revokeValidator, pauseContract, unpauseContract, withdrawFeesController, introspectToken, revokeTokenController, reindex, getValidatorStatsEndpoint, getAuditLog, importValidators } from '../controllers/adminController';
 import { exportEvents } from '../controllers/exportController';
 import { requireRole } from '../middleware/auth';
 import { ipAllowlistMiddleware } from '../middleware/ipAllowlist';
@@ -136,6 +137,35 @@ router.route('/validators/register')
 router.route('/validators/revoke')
   .post(requireRole('admin'), revokeValidator)
   .all(methodNotAllowed(['POST']));
+
+/**
+ * POST /api/admin/validators/import
+ *
+ * Bulk-onboards validators from a CSV or JSON batch.
+ * Accepts either:
+ *   - JSON body: { validators: [{ wallet, label?, region? }, …] }
+ *   - CSV body (Content-Type: text/csv): rows of wallet[,label[,region]]
+ *
+ * Each entry is validated and processed through the same single-registration
+ * path. Invalid addresses and already-registered (non-revoked) validators are
+ * skipped per-entry rather than failing the whole batch.
+ *
+ * @body { validators: ValidatorEntry[] } | CSV text
+ * @response 200 { success: true, data: { results, summary } }
+ * @response 400 { success: false, error: string } - Empty or unparseable body
+ * @response 401 { success: false, error: string } - Missing token
+ * @response 403 { success: false, error: string } - Non-admin role
+ * @auth Bearer (admin role required)
+ */
+router.post(
+  '/validators/import',
+  requireRole('admin'),
+  // Parse text/csv and text/plain bodies as raw strings so the controller
+  // can handle CSV formatting. JSON bodies are already parsed by the global
+  // express.json() middleware in app.ts.
+  express.text({ type: ['text/csv', 'text/plain'], limit: '1mb' }),
+  importValidators,
+);
 
 /**
  * POST /api/admin/contract/pause
